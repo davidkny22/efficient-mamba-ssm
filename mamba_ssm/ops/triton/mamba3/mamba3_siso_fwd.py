@@ -13,6 +13,7 @@ from einops import rearrange, repeat
 
 import triton
 import triton.language as tl
+from mamba_ssm.ops.triton.mamba3.quantize_helpers import quantize_block_e4m3, quantize_block_e2m1
 from mamba_ssm.ops.triton.mamba3.utils import cos_approx, sin_approx, tanh_approx, silu, sigmoid_approx
 
 @triton.autotune(
@@ -77,6 +78,8 @@ def mamba3_siso_fwd_kernel(
     HAS_D: tl.constexpr,
     HAS_Z: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    SKIP_PREPROCESSING: tl.constexpr = False,
+    KERNEL_PRECISION: tl.constexpr = "bf16",
 ):
     """
     Mamba-3 forward kernel.
@@ -253,83 +256,84 @@ def mamba3_siso_fwd_kernel(
             block_shape=[HEADDIM_V, HEADDIM_QK],
         )
 
-    # Phase 1: Preprocessing - Apply bias, rotary embeddings, compute QK dots.
-    for chunk_idx in range(num_chunks):
-        chunk_start = chunk_idx * CHUNK_SIZE
-        offs_seqlen = chunk_start + tl.arange(0, CHUNK_SIZE)
-        offs_hd = tl.arange(0, HEADDIM_QK)
-        offs_hdr = tl.arange(0, HEADDIM_QK // 2)
+    if not SKIP_PREPROCESSING:
+        # Phase 1: Preprocessing - Apply bias, rotary embeddings, compute QK dots.
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * CHUNK_SIZE
+            offs_seqlen = chunk_start + tl.arange(0, CHUNK_SIZE)
+            offs_hd = tl.arange(0, HEADDIM_QK)
+            offs_hdr = tl.arange(0, HEADDIM_QK // 2)
 
-        # Load Q and K blocks via TMA
-        q_pre_block = q_desc.load([chunk_start, 0])
-        k_pre_block = k_desc.load([chunk_start, 0])
-        
-        # Load rotary angles
-        angle_block = tl.load(
-            angle_ptr + offs_seqlen[:, None] * stride_angles_seqlen + offs_hdr[None, :] * stride_angles_qkdim,
-            mask=(offs_seqlen[:, None] < seqlen) & (offs_hdr[None, :] < headdim_angles), other=0.0
-        )
-        
-        # Compute shifted gamma and scale
-        dt = tl.load(dt_ptr + offs_seqlen * stride_dt_seqlen, mask=offs_seqlen < seqlen, other=0.0).to(tl.float32)
-        dt_shifted = tl.load(
-            dt_ptr + (offs_seqlen + 1) * stride_dt_seqlen, 
-            mask=offs_seqlen + 1 < seqlen, other=0.0).to(tl.float32)
-        trap = tl.load(trap_ptr + offs_seqlen * stride_trap_seqlen, mask=offs_seqlen < seqlen, other=0.0).to(tl.float32)
-        trap = sigmoid_approx(trap)
-        trap_shifted = tl.load(
-            trap_ptr + (offs_seqlen + 1) * stride_trap_seqlen, 
-            mask=offs_seqlen + 1 < seqlen, other=0.0).to(tl.float32)
-        trap_shifted = sigmoid_approx(trap_shifted)
-
-        shifted_gamma = dt_shifted * (1 - trap_shifted)
-        gamma = dt * trap
-        scale = shifted_gamma + gamma
-
-        # Store scale and shifted gamma for backward pass
-        tl.store(gamma_store_ptr + offs_seqlen * stride_gamma_store_seqlen, gamma, mask=offs_seqlen < seqlen)
-        tl.store(scale_store_ptr + offs_seqlen * stride_scale_store_seqlen, scale, mask=offs_seqlen < seqlen)
-
-        # Add biases to Q and K
-        q_bias_block = tl.load(q_bias_ptr + offs_hd * stride_q_bias_qkdim, offs_hd < headdim_qk)
-        q_pre_block += q_bias_block[None, :]
-        k_bias_block = tl.load(k_bias_ptr + offs_hd * stride_k_bias_qkdim, offs_hd < headdim_qk)
-        k_pre_block += k_bias_block[None, :]
-
-        # Compute QK dot products for skip connection
-        store_qk_dot = tl.dot(
-            q_pre_block * k_pre_block,
-            tl.full([HEADDIM_QK, 1], 1, dtype=q_pre_block.dtype)
-        ).to(q_pre_block.dtype)
-        store_qk_dot = store_qk_dot.reshape(CHUNK_SIZE)
-        store_qk_dot *= gamma
-        tl.store(qk_store_ptr + offs_seqlen * stride_qk_store_seqlen, store_qk_dot, mask=offs_seqlen < seqlen)
-        
-        # Compute rotary embedding cos/sin
-        cos_block = cos_approx(angle_block.to(tl.float32))
-        sin_block = sin_approx(angle_block.to(tl.float32))
-
-        # Apply rotary embeddings to K and scale
-        k0, k1 = tl.split(tl.reshape(k_pre_block, [CHUNK_SIZE, HEADDIM_QK // 2, 2]))
-        ko0 = k0 * cos_block - k1 * sin_block
-        ko1 = k0 * sin_block + k1 * cos_block
-        k_pre_block = tl.reshape(tl.join(ko0, ko1), [CHUNK_SIZE, HEADDIM_QK]).to(k_pre_block.dtype)
-
-        if chunk_idx == num_chunks - 1 and RETURN_FINAL_STATES:
-            tl.store(final_k_state_ptr + tl.arange(0, CHUNK_SIZE)[:, None] * stride_final_k_state_chunk 
-                + offs_hd[None, :] * stride_final_k_state_qkdim, 
-                k_pre_block,
-                mask=(offs_hd[None, :] < headdim_qk))
+            # Load Q and K blocks via TMA
+            q_pre_block = q_desc.load([chunk_start, 0])
+            k_pre_block = k_desc.load([chunk_start, 0])
             
-        k_pre_block *= scale[:, None]
-        k_store_desc.store([chunk_start, 0], k_pre_block)
+            # Load rotary angles
+            angle_block = tl.load(
+                angle_ptr + offs_seqlen[:, None] * stride_angles_seqlen + offs_hdr[None, :] * stride_angles_qkdim,
+                mask=(offs_seqlen[:, None] < seqlen) & (offs_hdr[None, :] < headdim_angles), other=0.0
+            )
+            
+            # Compute shifted gamma and scale
+            dt = tl.load(dt_ptr + offs_seqlen * stride_dt_seqlen, mask=offs_seqlen < seqlen, other=0.0).to(tl.float32)
+            dt_shifted = tl.load(
+                dt_ptr + (offs_seqlen + 1) * stride_dt_seqlen, 
+                mask=offs_seqlen + 1 < seqlen, other=0.0).to(tl.float32)
+            trap = tl.load(trap_ptr + offs_seqlen * stride_trap_seqlen, mask=offs_seqlen < seqlen, other=0.0).to(tl.float32)
+            trap = sigmoid_approx(trap)
+            trap_shifted = tl.load(
+                trap_ptr + (offs_seqlen + 1) * stride_trap_seqlen, 
+                mask=offs_seqlen + 1 < seqlen, other=0.0).to(tl.float32)
+            trap_shifted = sigmoid_approx(trap_shifted)
 
-        # Apply rotary embeddings to Q
-        q0, q1 = tl.split(tl.reshape(q_pre_block, [CHUNK_SIZE, HEADDIM_QK // 2, 2]))
-        qo0 = q0 * cos_block - q1 * sin_block
-        qo1 = q0 * sin_block + q1 * cos_block
-        q_pre_block = tl.reshape(tl.join(qo0, qo1), [CHUNK_SIZE, HEADDIM_QK]).to(q_pre_block.dtype)
-        q_store_desc.store([chunk_start, 0], q_pre_block)
+            shifted_gamma = dt_shifted * (1 - trap_shifted)
+            gamma = dt * trap
+            scale = shifted_gamma + gamma
+
+            # Store scale and shifted gamma for backward pass
+            tl.store(gamma_store_ptr + offs_seqlen * stride_gamma_store_seqlen, gamma, mask=offs_seqlen < seqlen)
+            tl.store(scale_store_ptr + offs_seqlen * stride_scale_store_seqlen, scale, mask=offs_seqlen < seqlen)
+
+            # Add biases to Q and K
+            q_bias_block = tl.load(q_bias_ptr + offs_hd * stride_q_bias_qkdim, offs_hd < headdim_qk)
+            q_pre_block += q_bias_block[None, :]
+            k_bias_block = tl.load(k_bias_ptr + offs_hd * stride_k_bias_qkdim, offs_hd < headdim_qk)
+            k_pre_block += k_bias_block[None, :]
+
+            # Compute QK dot products for skip connection
+            store_qk_dot = tl.dot(
+                q_pre_block * k_pre_block,
+                tl.full([HEADDIM_QK, 1], 1, dtype=q_pre_block.dtype)
+            ).to(q_pre_block.dtype)
+            store_qk_dot = store_qk_dot.reshape(CHUNK_SIZE)
+            store_qk_dot *= gamma
+            tl.store(qk_store_ptr + offs_seqlen * stride_qk_store_seqlen, store_qk_dot, mask=offs_seqlen < seqlen)
+            
+            # Compute rotary embedding cos/sin
+            cos_block = cos_approx(angle_block.to(tl.float32))
+            sin_block = sin_approx(angle_block.to(tl.float32))
+
+            # Apply rotary embeddings to K and scale
+            k0, k1 = tl.split(tl.reshape(k_pre_block, [CHUNK_SIZE, HEADDIM_QK // 2, 2]))
+            ko0 = k0 * cos_block - k1 * sin_block
+            ko1 = k0 * sin_block + k1 * cos_block
+            k_pre_block = tl.reshape(tl.join(ko0, ko1), [CHUNK_SIZE, HEADDIM_QK]).to(k_pre_block.dtype)
+
+            if chunk_idx == num_chunks - 1 and RETURN_FINAL_STATES:
+                tl.store(final_k_state_ptr + tl.arange(0, CHUNK_SIZE)[:, None] * stride_final_k_state_chunk 
+                    + offs_hd[None, :] * stride_final_k_state_qkdim, 
+                    k_pre_block,
+                    mask=(offs_hd[None, :] < headdim_qk))
+                
+            k_pre_block *= scale[:, None]
+            k_store_desc.store([chunk_start, 0], k_pre_block)
+
+            # Apply rotary embeddings to Q
+            q0, q1 = tl.split(tl.reshape(q_pre_block, [CHUNK_SIZE, HEADDIM_QK // 2, 2]))
+            qo0 = q0 * cos_block - q1 * sin_block
+            qo1 = q0 * sin_block + q1 * cos_block
+            q_pre_block = tl.reshape(tl.join(qo0, qo1), [CHUNK_SIZE, HEADDIM_QK]).to(q_pre_block.dtype)
+            q_store_desc.store([chunk_start, 0], q_pre_block)
 
     # Phase 2: Main computation and output generation.
     if HAS_INITIAL_STATES:
@@ -384,19 +388,46 @@ def mamba3_siso_fwd_kernel(
             tl.store(da_cs_sum_store_ptr + chunk_idx * stride_da_cs_sum_store_seqlen, da_cs_last)
 
         # Output contribution from previous state: Q @ SSM_States^T * exp(da_cs)
-        acc_o = tl.dot(q_block, tl.trans(acc_ssm_states).to(q_block.dtype))
+        if KERNEL_PRECISION == "bf16":
+            acc_o = tl.dot(q_block, tl.trans(acc_ssm_states).to(q_block.dtype))
+        elif KERNEL_PRECISION == "fp8":
+            q8, sq = quantize_block_e4m3(q_block)
+            s8, ss = quantize_block_e4m3(tl.trans(acc_ssm_states))
+            acc_o = tl.dot_scaled(q8, sq, "e4m3", tl.trans(s8), ss, "e4m3")
+        elif KERNEL_PRECISION == "fp4":
+            q4, sq = quantize_block_e2m1(q_block)
+            s4, ss = quantize_block_e2m1(tl.trans(acc_ssm_states))
+            acc_o = tl.dot_scaled(q4, sq, "e2m1", tl.trans(s4), ss, "e2m1")
         acc_o *= tl.math.exp2(da_cs)[:, None]
 
         # Output contribution from current chunk: causal(Q @ K^T * exp(decay)) @ V
         # NOTE: We compute the (i,i) component using QK dot to prevent non-causal numerical leakage
-        s_block = tl.dot(q_block, tl.trans(k_block))
+        if KERNEL_PRECISION == "bf16":
+            s_block = tl.dot(q_block, tl.trans(k_block))
+        elif KERNEL_PRECISION == "fp8":
+            q8, sq = quantize_block_e4m3(q_block)
+            k8, sk = quantize_block_e4m3(k_block)
+            s_block = tl.dot_scaled(q8, sq, "e4m3", tl.trans(k8), sk, "e4m3")
+        elif KERNEL_PRECISION == "fp4":
+            q4, sq = quantize_block_e2m1(q_block)
+            k4, sk = quantize_block_e2m1(k_block)
+            s_block = tl.dot_scaled(q4, sq, "e2m1", tl.trans(k4), sk, "e2m1")
         s_block *= tl.math.exp2(tl.minimum((da_cs[:, None] - da_cs[None, :]), 0.0))
         s_block = tl.where(
             tl.arange(0, CHUNK_SIZE)[:, None] > tl.arange(0, CHUNK_SIZE)[None, :], 
             s_block, 
             0.0
         )
-        acc_o += tl.dot(s_block.to(v_block.dtype), v_block)
+        if KERNEL_PRECISION == "bf16":
+            acc_o += tl.dot(s_block.to(v_block.dtype), v_block)
+        elif KERNEL_PRECISION == "fp8":
+            s8, ss = quantize_block_e4m3(s_block)
+            v8, sv = quantize_block_e4m3(v_block)
+            acc_o += tl.dot_scaled(s8, ss, "e4m3", tl.trans(v8), sv, "e4m3")
+        elif KERNEL_PRECISION == "fp4":
+            s8, ss = quantize_block_e4m3(s_block)
+            v4, sv = quantize_block_e2m1(v_block)
+            acc_o += tl.dot_scaled(s8, ss, "e4m3", tl.trans(v4), sv, "e2m1")
 
         # Add D-skip connection and subtract QK dot contribution
         qk_dot = tl.load(qk_store_ptr + offs_seqlen * stride_qk_store_seqlen, mask=offs_seqlen < seqlen, other=0.0)
@@ -420,9 +451,13 @@ def mamba3_siso_fwd_kernel(
         # Update recurrent states
         scale = tl.math.exp2(da_cs_rev)
         v_block *= scale[:, None]
-        acc_ssm_states = acc_ssm_states * tl.math.exp2(da_cs_last) + tl.dot(
-            tl.trans(v_block).to(k_block.dtype), k_block
-        )
+        if KERNEL_PRECISION == "bf16":
+            state_update = tl.dot(tl.trans(v_block).to(k_block.dtype), k_block)
+        elif KERNEL_PRECISION == "fp8" or KERNEL_PRECISION == "fp4":
+            v8, sv = quantize_block_e4m3(tl.trans(v_block))
+            k8, sk = quantize_block_e4m3(k_block)
+            state_update = tl.dot_scaled(v8, sv, "e4m3", tl.trans(k8), sk, "e4m3")
+        acc_ssm_states = acc_ssm_states * tl.math.exp2(da_cs_last) + state_update
 
     # Store final states if requested
     if RETURN_FINAL_STATES:
@@ -453,6 +488,8 @@ def mamba3_siso_fwd(
     chunk_size: int = 64,
     store_states_adt_outv: bool = False,
     return_final_states: bool = False,
+    skip_preprocessing: bool = False,
+    kernel_precision: str = "bf16",
     cu_seqlens: Optional[torch.Tensor] = None,
 ):
     """
@@ -685,6 +722,8 @@ def mamba3_siso_fwd(
         HAS_D=D is not None,
         HAS_Z=Z is not None,
         IS_VARLEN=is_varlen,
+        SKIP_PREPROCESSING=skip_preprocessing,
+        KERNEL_PRECISION=kernel_precision,
     )
 
     Final_States = None
