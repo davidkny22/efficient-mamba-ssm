@@ -72,6 +72,7 @@ class _Mamba3Function(torch.autograd.Function):
         chunk_size: int,
         memory_efficient: bool,
         return_final_states: bool,
+        kernel_precision: str = "bf16",
     ) -> Tensor | Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Forward pass: call Triton kernel and save tensors for backward."""
         
@@ -109,6 +110,7 @@ class _Mamba3Function(torch.autograd.Function):
             store_states_adt_outv=needs_backward and not memory_efficient,
             return_final_states=return_final_states,
             cu_seqlens=cu_seqlens,
+            kernel_precision=kernel_precision,
         )
 
         Final_SSM_State = Final_States[0] if Final_States is not None else None
@@ -121,6 +123,7 @@ class _Mamba3Function(torch.autograd.Function):
         ctx.has_input_state = Input_SSM_State is not None
         ctx.return_final_states = return_final_states
         ctx.has_varlen = has_varlen
+        ctx.kernel_precision = kernel_precision
 
         if needs_backward:
             _empty = torch.empty((), device=Q.device)
@@ -208,6 +211,7 @@ class _Mamba3Function(torch.autograd.Function):
                     store_states_adt_outv=True,
                     return_final_states=ctx.return_final_states,
                     cu_seqlens=cu_seqlens,
+                    kernel_precision=ctx.kernel_precision,
                 )
             Final_SSM_State = Final_States[0] if Final_States is not None else None
             Final_K_State = Final_States[1] if Final_States is not None else None
@@ -234,7 +238,7 @@ class _Mamba3Function(torch.autograd.Function):
         # Step 1: Compute dZ and scale grad_out if Z gating is present
         if Z is not None:
             dZ, grad_out_scaled = compute_dzdo(
-                grad_out, Z, Out_v, chunk_size=ctx.chunk_size
+                grad_out, Z, Out_v, chunk_size=ctx.chunk_size, kernel_precision=ctx.kernel_precision
             )
         else:
             dZ = None
@@ -256,6 +260,7 @@ class _Mamba3Function(torch.autograd.Function):
             chunk_size=ctx.chunk_size,
             has_input_state=ctx.has_input_state,
             Cu_Seqlens=cu_seqlens,
+            kernel_precision=ctx.kernel_precision,
         )
         
         # Step 3: Compute gradients through rotary embeddings and biases
@@ -273,6 +278,7 @@ class _Mamba3Function(torch.autograd.Function):
             d_ok_state=grad_final_k_state,
             chunk_size=ctx.chunk_size,
             Cu_Seqlens=cu_seqlens,
+            kernel_precision=ctx.kernel_precision,
         )
         
         # Step 4: Compute dDT, dTrap, and input state gradients
@@ -285,6 +291,7 @@ class _Mamba3Function(torch.autograd.Function):
             input_k_state=Input_K_State,
             input_v_state=Input_V_State,
             Cu_Seqlens=cu_seqlens,
+            kernel_precision=ctx.kernel_precision,
         )
         
         # Step 5: Compute gradients through angle_dt cumsum
@@ -329,6 +336,7 @@ class _Mamba3Function(torch.autograd.Function):
             None,                   # chunk_size (not differentiable)
             None,                   # memory_efficient (not differentiable)
             None,                   # return_final_states (not differentiable)
+            None,                   # kernel_precision (not differentiable)
         )
 
 
@@ -349,6 +357,7 @@ def mamba3_siso_combined(
     memory_efficient: bool = False,
     return_final_states: bool = False,
     cu_seqlens: Optional[Tensor] = None,
+    kernel_precision: str = "bf16",
 ) -> Tensor | Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Mamba-3 attention with Triton kernels and automatic differentiation.
 
@@ -390,6 +399,7 @@ def mamba3_siso_combined(
             contains all sequences concatenated.
         memory_efficient: If True, checkpoint the forward pass and recompute
             intermediates during backward to reduce activation memory.
+        kernel_precision: "bf16", "fp8", or "fp4" kernel matmul precision.
 
     Returns:
         If return_final_states=False:
@@ -451,5 +461,5 @@ def mamba3_siso_combined(
 
     return _Mamba3Function.apply(
         Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles, D, Z,
-        Input_Angle_State, Input_SSM_State, Input_K_State, Input_V_State, cu_seqlens, chunk_size, memory_efficient, return_final_states
+        Input_Angle_State, Input_SSM_State, Input_K_State, Input_V_State, cu_seqlens, chunk_size, memory_efficient, return_final_states, kernel_precision
     )
