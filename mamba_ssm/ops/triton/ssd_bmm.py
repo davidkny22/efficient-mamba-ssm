@@ -12,7 +12,17 @@ import triton.language as tl
 
 from einops import rearrange, repeat
 
+from mamba_ssm.ops.triton.mamba3.quantize_helpers import quantize_block_e4m3, quantize_block_e2m1, quantize_block_e5m2
 from mamba_ssm.utils.determinism import autotune_configs
+
+
+@triton.jit
+def _dot_e5m2(a, b, KERNEL_PRECISION: tl.constexpr):
+    if KERNEL_PRECISION == "bf16":
+        return tl.dot(a, b)
+    a8, sa = quantize_block_e5m2(a)
+    b8, sb = quantize_block_e5m2(b)
+    return tl.dot_scaled(a8, sa, "e5m2", tl.trans(b8), sb, "e5m2")
 
 
 def init_to_zero(names):
@@ -48,6 +58,7 @@ def _bmm_chunk_fwd_kernel(
     dot_dtype: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    KERNEL_PRECISION: tl.constexpr = "bf16",
 ):
     pid_b = tl.program_id(axis=1)
     pid_ch = tl.program_id(axis=2)
@@ -75,7 +86,16 @@ def _bmm_chunk_fwd_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < K - k * BLOCK_SIZE_K), other=0.0).to(dot_dtype)
         b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_n[None, :] < chunk_size_limit), other=0.0).to(dot_dtype)
-        acc += tl.dot(a, b)
+        if KERNEL_PRECISION == "bf16":
+            acc += tl.dot(a, b)
+        elif KERNEL_PRECISION == "fp8":
+            a8, sa = quantize_block_e4m3(a)
+            b8, sb = quantize_block_e4m3(b)
+            acc += tl.dot_scaled(a8, sa, "e4m3", tl.trans(b8), sb, "e4m3")
+        elif KERNEL_PRECISION == "fp4":
+            a4, sa = quantize_block_e2m1(a)
+            b4, sb = quantize_block_e2m1(b)
+            acc += tl.dot_scaled(a4, sa, "e2m1", tl.trans(b4), sb, "e2m1")
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -121,6 +141,7 @@ def _bmm_chunk_bwd_kernel(
     dot_dtype: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr,
+    KERNEL_PRECISION: tl.constexpr = "bf16",
 ):
     pid_b = tl.program_id(axis=1)
     pid_ch = tl.program_id(axis=2)
@@ -144,7 +165,7 @@ def _bmm_chunk_bwd_kernel(
     for cs in range(0, tl.cdiv(chunk_size_limit, BLOCK_SIZE_CS)):
         dout = tl.load(dout_ptrs, mask=(offs_m[:, None] < chunk_size) & (offs_cs[None, :] < chunk_size_limit - cs * BLOCK_SIZE_CS), other=0.0).to(dot_dtype)
         a = tl.load(a_ptrs, mask=(offs_cs[:, None] < chunk_size_limit - cs * BLOCK_SIZE_CS) & (offs_n[None, :] < K), other=0.0).to(dot_dtype)
-        acc += tl.dot(dout, a)
+        acc += _dot_e5m2(dout, a, KERNEL_PRECISION)
         dout_ptrs += BLOCK_SIZE_CS * stride_dout_csize_m
         a_ptrs += BLOCK_SIZE_CS * stride_a_seqlen
 
@@ -162,7 +183,7 @@ def _bmm_chunk_bwd_kernel(
     tl.store(db_ptrs, db, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < K))
 
 
-def _bmm_chunk_fwd(a, b, chunk_size, seq_idx=None, causal=False, output_dtype=None):
+def _bmm_chunk_fwd(a, b, chunk_size, seq_idx=None, causal=False, output_dtype=None, kernel_precision: str = "bf16"):
     """
     Argument:
         a: (batch, seqlen, k) or (batch, seqlen, ngroups, k)
@@ -206,11 +227,12 @@ def _bmm_chunk_fwd(a, b, chunk_size, seq_idx=None, causal=False, output_dtype=No
             causal,
             dot_dtype,
             HAS_SEQ_IDX=seq_idx is not None,
+            KERNEL_PRECISION=kernel_precision,
         )
     return out
 
 
-def _bmm_chunk_bwd(a, dout, residual=None, out=None):
+def _bmm_chunk_bwd(a, dout, residual=None, out=None, kernel_precision: str = "bf16"):
     """
     Argument:
         a: (batch, seqlen, k) or (batch, seqlen, ngroups, k)
@@ -260,5 +282,6 @@ def _bmm_chunk_bwd(a, dout, residual=None, out=None):
             residual_strides[0], residual_strides[1], residual_strides[2], residual_strides[3],
             dot_dtype,
             HAS_RESIDUAL=residual is not None,
+            KERNEL_PRECISION=kernel_precision,
         )
     return out

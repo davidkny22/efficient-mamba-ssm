@@ -58,6 +58,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         # Fused kernel and sharding options
         chunk_size=256,
         use_mem_eff_path=True,
+        checkpoint_lvl=0,
         layer_idx=None,  # Absorb kwarg for general module
         process_group=None,
         sequence_parallel=True,
@@ -90,6 +91,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.activation = "silu"
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
+        self.checkpoint_lvl = checkpoint_lvl
         self.layer_idx = layer_idx
 
         # Order: [z, x, B, C, dt]
@@ -257,6 +259,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 **dt_limit_kwargs,
                 return_final_states=ssm_state is not None,
                 return_varlen_states=cu_seqlens is not None and inference_params is not None,
+                checkpoint_lvl=self.checkpoint_lvl,
             )
             if ssm_state is not None:
                 y, last_state, *rest = y

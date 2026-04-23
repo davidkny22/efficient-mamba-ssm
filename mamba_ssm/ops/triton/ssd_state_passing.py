@@ -120,6 +120,7 @@ def _state_passing_bwd_kernel(
     HAS_DINITSTATES: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    KERNEL_PRECISION: tl.constexpr = "bf16",
 ):
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
@@ -226,7 +227,7 @@ def _state_passing_fwd(states, dA_chunk_cumsum, initial_states=None, seq_idx=Non
 
 def _state_passing_bwd(
         states, dA_chunk_cumsum, dout, dfinal_states=None, seq_idx=None, has_initial_states=None,
-        dstates_dtype=None, states_dtype=None, chunk_size=None
+        dstates_dtype=None, states_dtype=None, chunk_size=None, kernel_precision: str = "bf16"
 ):
     """
     states contains the initial_states at index 0. The final states are not included in states.
@@ -274,6 +275,7 @@ def _state_passing_bwd(
             HAS_DFINAL_STATES=dfinal_states is not None,
             HAS_DINITSTATES=dinitstates is not None,
             HAS_SEQ_IDX=seq_idx is not None,
+            KERNEL_PRECISION=kernel_precision,
         )
     BLOCK_SIZE_actual = _state_passing_bwd_kernel.best_config.kwargs["BLOCK_SIZE"]
     n_valid_blocks = (dim + BLOCK_SIZE_actual - 1) // BLOCK_SIZE_actual

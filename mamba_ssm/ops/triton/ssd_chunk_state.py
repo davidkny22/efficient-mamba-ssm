@@ -12,6 +12,7 @@ import triton.language as tl
 
 from einops import rearrange, repeat
 
+from mamba_ssm.ops.triton.mamba3.quantize_helpers import quantize_block_e4m3, quantize_block_e5m2
 from mamba_ssm.ops.triton.softplus import softplus
 from mamba_ssm.utils.determinism import (
     alloc_tile_workspace,
@@ -19,6 +20,15 @@ from mamba_ssm.utils.determinism import (
     use_deterministic_mode,
     autotune_configs,
 )
+
+
+@triton.jit
+def _dot_e5m2(a, b, KERNEL_PRECISION: tl.constexpr):
+    if KERNEL_PRECISION == "bf16":
+        return tl.dot(a, b)
+    a8, sa = quantize_block_e5m2(a)
+    b8, sb = quantize_block_e5m2(b)
+    return tl.dot_scaled(a8, sa, "e5m2", tl.trans(b8), sb, "e5m2")
 
 
 def init_to_zero(names):
@@ -120,6 +130,7 @@ def _chunk_cumsum_bwd_kernel(
     HAS_DT_BIAS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_CHUNK: tl.constexpr,
     DETERMINISTIC_REDUCTION: tl.constexpr,
+    KERNEL_PRECISION: tl.constexpr = "bf16",
 ):
     pid_b = tl.program_id(axis=0)
     pid_c = tl.program_id(axis=1)
@@ -205,6 +216,7 @@ def _chunk_state_fwd_kernel(
     # Meta-parameters
     HAS_SEQ_IDX: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    KERNEL_PRECISION: tl.constexpr = "bf16",
 ):
     pid_bc = tl.program_id(axis=1)
     pid_c = pid_bc // batch
@@ -251,7 +263,12 @@ def _chunk_state_fwd_kernel(
             scale = tl.where((seq_idx_last >= 0) & (seq_idx_k == seq_idx_last), tl.exp(tl.minimum((dA_cs_last - dA_cs_k), 0.0)) * dt_k, 0.0)
         b *= scale[:, None]
         b = b.to(x_ptr.dtype.element_ty)
-        acc += tl.dot(x, b)
+        if KERNEL_PRECISION == "bf16":
+            acc += tl.dot(x, b)
+        elif KERNEL_PRECISION == "fp8" or KERNEL_PRECISION == "fp4":
+            x8, sx = quantize_block_e4m3(x)
+            b8, sb = quantize_block_e4m3(b)
+            acc += tl.dot_scaled(x8, sx, "e4m3", tl.trans(b8), sb, "e4m3")
         x_ptrs += BLOCK_SIZE_K * stride_x_seqlen
         b_ptrs += BLOCK_SIZE_K * stride_b_seqlen
         dt_ptrs += BLOCK_SIZE_K * stride_dt_csize
@@ -303,6 +320,7 @@ def _chunk_state_bwd_dx_kernel(
     DETERMINISTIC_REDUCTION: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
+    KERNEL_PRECISION: tl.constexpr = "bf16",
 ):
     pid_bc = tl.program_id(axis=1)
     pid_c = pid_bc // batch
@@ -331,14 +349,14 @@ def _chunk_state_bwd_dx_kernel(
         b = tl.load(b_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < dstate), other=0.0)
         dstates = tl.load(dstates_ptrs, mask=(offs_k[:, None] < dstate) & (offs_n[None, :] < hdim), other=0.0)
         dstates = dstates.to(b_ptr.dtype.element_ty)
-        acc = tl.dot(b, dstates)
+        acc = _dot_e5m2(b, dstates, KERNEL_PRECISION)
     else:
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for k in range(0, dstate, BLOCK_SIZE_K):
             b = tl.load(b_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < dstate - k), other=0.0)
             dstates = tl.load(dstates_ptrs, mask=(offs_k[:, None] < dstate - k) & (offs_n[None, :] < hdim), other=0.0)
             dstates = dstates.to(b_ptr.dtype.element_ty)
-            acc += tl.dot(b, dstates)
+            acc += _dot_e5m2(b, dstates, KERNEL_PRECISION)
             b_ptrs += BLOCK_SIZE_K * stride_b_dstate
             dstates_ptrs += BLOCK_SIZE_K * stride_states_dstate
 
@@ -416,6 +434,7 @@ def _chunk_state_bwd_db_kernel(
     HAS_SEQ_IDX: tl.constexpr,
     DETERMINISTIC_REDUCTION: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    KERNEL_PRECISION: tl.constexpr = "bf16",
 ):
     pid_bc = tl.program_id(axis=1)
     pid_c = pid_bc // batch
@@ -460,7 +479,7 @@ def _chunk_state_bwd_db_kernel(
         x = tl.load(x_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < hdim), other=0.0)
         dstates = tl.load(dstates_ptrs, mask=(offs_k[:, None] < hdim) & (offs_n[None, :] < dstate), other=0.0)
         dstates = dstates.to(x_ptrs.dtype.element_ty)
-        db = tl.dot(x, dstates)
+        db = _dot_e5m2(x, dstates, KERNEL_PRECISION)
         dA_cs_last = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
         dA_cs_m = tl.load(dA_cumsum_ptrs, mask=offs_m < chunk_size, other=0.0).to(tl.float32)
         dt_m = tl.load(dt_ptrs, mask=offs_m < chunk_size, other=0.0).to(tl.float32)
@@ -545,6 +564,7 @@ def _chunk_state_bwd_ddAcs_stable_kernel(
     DETERMINISTIC_REDUCTION: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
+    KERNEL_PRECISION: tl.constexpr = "bf16",
 ):
     pid_bc = tl.program_id(axis=1)
     pid_c = pid_bc // batch
@@ -574,14 +594,14 @@ def _chunk_state_bwd_ddAcs_stable_kernel(
         b = tl.load(b_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < dstate), other=0.0)
         dstates = tl.load(dstates_ptrs, mask=(offs_k[:, None] < dstate) & (offs_n[None, :] < hdim), other=0.0)
         dstates = dstates.to(b_ptr.dtype.element_ty)
-        acc = tl.dot(b, dstates)
+        acc = _dot_e5m2(b, dstates, KERNEL_PRECISION)
     else:
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for k in range(0, dstate, BLOCK_SIZE_K):
             b = tl.load(b_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k[None, :] < dstate - k), other=0.0)
             dstates = tl.load(dstates_ptrs, mask=(offs_k[:, None] < dstate - k) & (offs_n[None, :] < hdim), other=0.0)
             dstates = dstates.to(b_ptr.dtype.element_ty)
-            acc += tl.dot(b, dstates)
+            acc += _dot_e5m2(b, dstates, KERNEL_PRECISION)
             b_ptrs += BLOCK_SIZE_K * stride_b_dstate
             dstates_ptrs += BLOCK_SIZE_K * stride_states_dstate
 
@@ -652,6 +672,7 @@ def _chunk_state_varlen_kernel(
     stride_states_batch, stride_states_head, stride_states_hdim, stride_states_dstate,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    KERNEL_PRECISION: tl.constexpr = "bf16",
 ):
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
@@ -691,7 +712,12 @@ def _chunk_state_varlen_kernel(
                          tl.exp(tl.minimum((dA_cs_last - dA_cs_k), 0.0)) * dt_k, 0.0)
         b *= scale[:, None]
         b = b.to(x_ptr.dtype.element_ty)
-        acc += tl.dot(x, b)
+        if KERNEL_PRECISION == "bf16":
+            acc += tl.dot(x, b)
+        elif KERNEL_PRECISION == "fp8" or KERNEL_PRECISION == "fp4":
+            x8, sx = quantize_block_e4m3(x)
+            b8, sb = quantize_block_e4m3(b)
+            acc += tl.dot_scaled(x8, sx, "e4m3", tl.trans(b8), sb, "e4m3")
         x_ptrs += BLOCK_SIZE_K * stride_x_seqlen
         b_ptrs += BLOCK_SIZE_K * stride_b_seqlen
         dt_ptrs += BLOCK_SIZE_K * stride_dt_csize
@@ -741,7 +767,7 @@ def _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=None, dt_softplus=False, dt_lim
     return dA_cumsum, dt_out
 
 
-def _chunk_cumsum_bwd(ddA, ddt_out, dt, A, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf")), ddt=None):
+def _chunk_cumsum_bwd(ddA, ddt_out, dt, A, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf")), ddt=None, kernel_precision: str = "bf16"):
     batch, seqlen, nheads = dt.shape
     _, _, nchunks, chunk_size = ddA.shape
     assert ddA.shape == (batch, nheads, nchunks, chunk_size)
@@ -801,6 +827,7 @@ def _chunk_cumsum_bwd(ddA, ddt_out, dt, A, dt_bias=None, dt_softplus=False, dt_l
             HAS_DT_BIAS=dt_bias is not None,
             BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
             DETERMINISTIC_REDUCTION=deterministic,
+            KERNEL_PRECISION=kernel_precision,
         )
     if deterministic:
         dA.copy_(dA_workspace.sum(dim=(0, 1)))
@@ -809,7 +836,7 @@ def _chunk_cumsum_bwd(ddA, ddt_out, dt, A, dt_bias=None, dt_softplus=False, dt_l
     return ddt, dA, ddt_bias
 
 
-def _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=None, states=None, states_in_fp32=True):
+def _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=None, states=None, states_in_fp32=True, kernel_precision: str = "bf16"):
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = B.shape
@@ -838,11 +865,12 @@ def _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=None, states=None, states_in_f
             dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3),
             *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
             HAS_SEQ_IDX=seq_idx is not None,
+            KERNEL_PRECISION=kernel_precision,
         )
     return states
 
 
-def _chunk_state_bwd_dx(B, x, dt, dA_cumsum, dstates, dx=None):
+def _chunk_state_bwd_dx(B, x, dt, dA_cumsum, dstates, dx=None, kernel_precision: str = "bf16"):
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = B.shape
@@ -890,6 +918,7 @@ def _chunk_state_bwd_dx(B, x, dt, dA_cumsum, dstates, dx=None):
             ddA_cumsum.stride(0), ddA_cumsum.stride(2), ddA_cumsum.stride(1), ddA_cumsum.stride(3), stride_ddA_tile,
             DETERMINISTIC_REDUCTION=deterministic,
             BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
+            KERNEL_PRECISION=kernel_precision,
         )
     ddt = finalize_tile_workspace(ddt, deterministic)
     ddA_cumsum = finalize_tile_workspace(ddA_cumsum, deterministic)
@@ -899,7 +928,7 @@ def _chunk_state_bwd_dx(B, x, dt, dA_cumsum, dstates, dx=None):
     return dx, ddt, ddA_cumsum
 
 
-def _chunk_state_bwd_db(x, dt, dA_cumsum, dstates, seq_idx=None, B=None, ngroups=1):
+def _chunk_state_bwd_db(x, dt, dA_cumsum, dstates, seq_idx=None, B=None, ngroups=1, kernel_precision: str = "bf16"):
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     dstate = dstates.shape[-1]
@@ -957,6 +986,7 @@ def _chunk_state_bwd_db(x, dt, dA_cumsum, dstates, seq_idx=None, B=None, ngroups
             HAS_SEQ_IDX=seq_idx is not None,
             DETERMINISTIC_REDUCTION=deterministic,
             BLOCK_SIZE_K=max(triton.next_power_of_2(headdim), 16),
+            KERNEL_PRECISION=kernel_precision,
         )
     dB = dB.sum(2)
     if ddA_cumsum is not None:
@@ -969,7 +999,7 @@ def _chunk_state_bwd_db(x, dt, dA_cumsum, dstates, seq_idx=None, B=None, ngroups
     return dB if B is None else (dB, ddA_cumsum)
 
 
-def _chunk_state_bwd_ddAcs_stable(B, x, dt, dA_cumsum, dstates, seq_idx=None):
+def _chunk_state_bwd_ddAcs_stable(B, x, dt, dA_cumsum, dstates, seq_idx=None, kernel_precision: str = "bf16"):
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = B.shape
@@ -1009,13 +1039,14 @@ def _chunk_state_bwd_ddAcs_stable(B, x, dt, dA_cumsum, dstates, seq_idx=None):
             DETERMINISTIC_REDUCTION=deterministic,
             BLOCK_SIZE_M=max(triton.next_power_of_2(chunk_size), 16),
             BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
+            KERNEL_PRECISION=kernel_precision,
         )
     ddA_cumsum = finalize_tile_workspace(ddA_cumsum, deterministic)
     torch.cumsum(ddA_cumsum[..., 1:], dim=-1, out=ddA_cumsum[..., 1:])
     return ddA_cumsum
 
 
-def chunk_state_varlen(B, x, dt, dA_cumsum, cu_seqlens, chunk_states):
+def chunk_state_varlen(B, x, dt, dA_cumsum, cu_seqlens, chunk_states, kernel_precision: str = "bf16"):
     total_seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape
@@ -1040,6 +1071,7 @@ def chunk_state_varlen(B, x, dt, dA_cumsum, cu_seqlens, chunk_states):
             dA_cumsum.stride(1), dA_cumsum.stride(0), dA_cumsum.stride(2),
             chunk_states.stride(0), chunk_states.stride(1), chunk_states.stride(2), chunk_states.stride(3),
             states.stride(0), states.stride(1), states.stride(2), states.stride(3),
+            KERNEL_PRECISION=kernel_precision,
         )
     return states
 
