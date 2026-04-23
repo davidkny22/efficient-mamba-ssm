@@ -175,8 +175,8 @@ class Mamba3(nn.Module):
         DT = rearrange(DT, "b l n -> b n l")
         ADT = rearrange(ADT, "b l n -> b n l")
 
-        # Compute angle — cast to float32 as required by the MIMO/SISO kernels
-        angles = angles.unsqueeze(-2).expand(-1, -1, self.nheads, -1).to(torch.float32) # (B, L, N, S)
+        # Compute angle — cast to float32 before expand to avoid materializing a large bf16 copy
+        angles = angles.to(torch.float32).unsqueeze(-2).expand(-1, -1, self.nheads, -1) # (B, L, N, S)
 
         # Apply RMS Norm on B and C
         B = self.B_norm(B)
@@ -202,7 +202,6 @@ class Mamba3(nn.Module):
                 chunk_size=self.chunk_size,
                 rotary_dim_divisor=self.rotary_dim_divisor,
                 dtype=x.dtype,
-                memory_efficient=self.use_mem_eff_path,
                 return_state=ssm_state is not None,
                 cu_seqlens=cu_seqlens,
             )
@@ -235,6 +234,7 @@ class Mamba3(nn.Module):
                 Z=z if not self.is_outproj_norm else None,
                 chunk_size=self.chunk_size,
                 Input_States=None,
+                memory_efficient=self.use_mem_eff_path,
                 return_final_states=ssm_state is not None,
                 cu_seqlens=cu_seqlens,
             )
@@ -249,7 +249,7 @@ class Mamba3(nn.Module):
                 z = rearrange(z, "b l h p -> b l (h p)")
                 y = self.norm(y, z)
         
-        out = self.out_proj(y.to(x.dtype))
+        out = self.out_proj(y if y.dtype == x.dtype else y.to(x.dtype))
         return out
     
 
@@ -272,7 +272,7 @@ class Mamba3(nn.Module):
         x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
         z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
 
-        angles = angle_proj.unsqueeze(-2).expand(-1, self.nheads, -1)
+        angles = angle_proj.to(torch.float32).unsqueeze(-2).expand(-1, self.nheads, -1)
 
         return DT, B, C, x, z, trap, _A, angles
 
