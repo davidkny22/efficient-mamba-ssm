@@ -70,6 +70,7 @@ class _Mamba3Function(torch.autograd.Function):
         Input_V_State: Optional[Tensor],
         cu_seqlens: Optional[Tensor],
         chunk_size: int,
+        memory_efficient: bool,
         return_final_states: bool,
     ) -> Tensor | Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Forward pass: call Triton kernel and save tensors for backward."""
@@ -81,6 +82,7 @@ class _Mamba3Function(torch.autograd.Function):
         
         needs_backward = any(ctx.needs_input_grad)
         has_varlen = cu_seqlens is not None
+        ctx.memory_efficient = memory_efficient
 
         all_states_present = (Input_SSM_State is not None) and (Input_K_State is not None) and (Input_V_State is not None) and (Input_Angle_State is not None)
         all_states_absent = (Input_SSM_State is None) and (Input_K_State is None) and (Input_V_State is None) and (Input_Angle_State is None)
@@ -104,7 +106,7 @@ class _Mamba3Function(torch.autograd.Function):
         Out, Out_v, SSM_States, DA_CS, DA_CS_SUM, Q_rot, K_scaled, QK_dot, Scale, Gamma, Final_States = mamba3_siso_fwd(
             Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles_Cumsum, D, Z, Input_States,
             chunk_size=chunk_size,
-            store_states_adt_outv=needs_backward,
+            store_states_adt_outv=needs_backward and not memory_efficient,
             return_final_states=return_final_states,
             cu_seqlens=cu_seqlens,
         )
@@ -120,22 +122,37 @@ class _Mamba3Function(torch.autograd.Function):
             ctx.has_input_state = Input_SSM_State is not None
             ctx.return_final_states = return_final_states
             ctx.has_varlen = has_varlen
-            
-            # Save tensors - use empty tensor placeholders for None values
-            D_save = D if D is not None else torch.empty((), device=Q.device)
-            Z_save = Z if Z is not None else torch.empty((), device=Q.device)
-            Input_SSM_State_save = Input_SSM_State if Input_SSM_State is not None else torch.empty((), device=Q.device)
-            Input_K_State_save = Input_K_State if Input_K_State is not None else torch.empty((), device=Q.device)
-            Input_V_State_save = Input_V_State if Input_V_State is not None else torch.empty((), device=Q.device)
-            Final_SSM_State_save = Final_SSM_State if Final_SSM_State is not None else torch.empty((), device=Q.device)
-            cu_seqlens_save = cu_seqlens if cu_seqlens is not None else torch.empty((), device=Q.device, dtype=torch.int32)
-            
-            ctx.save_for_backward(
-                Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles, Angles_Cumsum,
-                D_save, Z_save, Input_SSM_State_save, Input_K_State_save, Input_V_State_save,
-                Out, Out_v, SSM_States, DA_CS, DA_CS_SUM, Q_rot, K_scaled, QK_dot, Scale, Gamma,
-                Final_SSM_State_save, cu_seqlens_save
-            )
+
+            if memory_efficient:
+                D_save = D if D is not None else torch.empty((), device=Q.device)
+                Z_save = Z if Z is not None else torch.empty((), device=Q.device)
+                Input_Angle_State_save = Input_Angle_State if Input_Angle_State is not None else torch.empty((), device=Q.device)
+                Input_SSM_State_save = Input_SSM_State if Input_SSM_State is not None else torch.empty((), device=Q.device)
+                Input_K_State_save = Input_K_State if Input_K_State is not None else torch.empty((), device=Q.device)
+                Input_V_State_save = Input_V_State if Input_V_State is not None else torch.empty((), device=Q.device)
+                cu_seqlens_save = cu_seqlens if cu_seqlens is not None else torch.empty((), device=Q.device, dtype=torch.int32)
+                ctx.save_for_backward(
+                    Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles,
+                    D_save, Z_save, Input_Angle_State_save, Input_SSM_State_save, Input_K_State_save, Input_V_State_save,
+                    cu_seqlens_save,
+                )
+            else:
+                # Save tensors - use empty tensor placeholders for None values
+                D_save = D if D is not None else torch.empty((), device=Q.device)
+                Z_save = Z if Z is not None else torch.empty((), device=Q.device)
+                Input_Angle_State_save = Input_Angle_State if Input_Angle_State is not None else torch.empty((), device=Q.device)
+                Input_SSM_State_save = Input_SSM_State if Input_SSM_State is not None else torch.empty((), device=Q.device)
+                Input_K_State_save = Input_K_State if Input_K_State is not None else torch.empty((), device=Q.device)
+                Input_V_State_save = Input_V_State if Input_V_State is not None else torch.empty((), device=Q.device)
+                Final_SSM_State_save = Final_SSM_State if Final_SSM_State is not None else torch.empty((), device=Q.device)
+                cu_seqlens_save = cu_seqlens if cu_seqlens is not None else torch.empty((), device=Q.device, dtype=torch.int32)
+
+                ctx.save_for_backward(
+                    Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles, Angles_Cumsum,
+                    D_save, Z_save, Input_Angle_State_save, Input_SSM_State_save, Input_K_State_save, Input_V_State_save,
+                    Out, Out_v, SSM_States, DA_CS, DA_CS_SUM, Q_rot, K_scaled, QK_dot, Scale, Gamma,
+                    Final_SSM_State_save, cu_seqlens_save
+                )
         else:
             ctx.chunk_size = chunk_size
             ctx.has_D = D is not None
@@ -173,10 +190,48 @@ class _Mamba3Function(torch.autograd.Function):
         if grad_out is None and grad_final_ssm_state is None and grad_final_k_state is None and grad_final_v_state is None and grad_final_angle_state is None:
             raise RuntimeError("No gradients provided for backward pass.")
 
-        (Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles, Angles_Cumsum,
-        D_save, Z_save, Input_SSM_State_save, Input_K_State_save, Input_V_State_save,
-        Out, Out_v, SSM_States, DA_CS, DA_CS_SUM, Q_rot, K_scaled, QK_dot, Scale, Gamma,
-        Final_SSM_State_save, cu_seqlens_save) = ctx.saved_tensors
+        if ctx.memory_efficient:
+            (Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles,
+             D_save, Z_save, Input_Angle_State_save, Input_SSM_State_save, Input_K_State_save, Input_V_State_save,
+             cu_seqlens_save) = ctx.saved_tensors
+            D = D_save if ctx.has_D else None
+            Z = Z_save if ctx.has_Z else None
+            Input_Angle_State = Input_Angle_State_save if ctx.has_input_state else None
+            Input_SSM_State = Input_SSM_State_save if ctx.has_input_state else None
+            Input_K_State = Input_K_State_save if ctx.has_input_state else None
+            Input_V_State = Input_V_State_save if ctx.has_input_state else None
+            cu_seqlens = cu_seqlens_save if ctx.has_varlen else None
+            with torch.no_grad():
+                Angles_Cumsum, _ = angle_dt_fwd(
+                    Angles, DT,
+                    init_state=Input_Angle_State,
+                    chunk_size=ctx.chunk_size,
+                    return_output_state=True,
+                    cu_seqlens=cu_seqlens,
+                )
+                Input_States = (
+                    (Input_Angle_State, Input_SSM_State, Input_K_State, Input_V_State)
+                    if Input_SSM_State is not None
+                    else None
+                )
+                Out, Out_v, SSM_States, DA_CS, DA_CS_SUM, Q_rot, K_scaled, QK_dot, Scale, Gamma, Final_States = mamba3_siso_fwd(
+                    Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles_Cumsum, D, Z, Input_States,
+                    chunk_size=ctx.chunk_size,
+                    store_states_adt_outv=True,
+                    return_final_states=ctx.return_final_states,
+                    cu_seqlens=cu_seqlens,
+                )
+            Final_SSM_State = Final_States[0] if Final_States is not None else None
+            Final_K_State = Final_States[1] if Final_States is not None else None
+            Final_V_State = Final_States[2] if Final_States is not None else None
+        else:
+            (Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles, Angles_Cumsum,
+             D_save, Z_save, Input_Angle_State_save, Input_SSM_State_save, Input_K_State_save, Input_V_State_save,
+             Out, Out_v, SSM_States, DA_CS, DA_CS_SUM, Q_rot, K_scaled, QK_dot, Scale, Gamma,
+             Final_SSM_State_save, cu_seqlens_save) = ctx.saved_tensors
+            Final_SSM_State = Final_SSM_State_save if ctx.return_final_states else None
+            Final_K_State = None
+            Final_V_State = None
         
         D = D_save if ctx.has_D else None
         Z = Z_save if ctx.has_Z else None
@@ -302,6 +357,7 @@ def mamba3_siso_combined(
     Z: Optional[Tensor] = None,
     Input_States: Optional[Tuple[Tensor, Tensor, Tensor, Tensor]] = None,
     chunk_size: int = 64,
+    memory_efficient: bool = False,
     return_final_states: bool = False,
     cu_seqlens: Optional[Tensor] = None,
 ) -> Tensor | Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -343,6 +399,8 @@ def mamba3_siso_combined(
             Example: [0, 128, 256, 512] for 3 sequences of lengths 128, 128, 256.
             When using cu_seqlens, batch must be 1 and the seqlen dimension
             contains all sequences concatenated.
+        memory_efficient: If True, checkpoint the forward pass and recompute
+            intermediates during backward to reduce activation memory.
 
     Returns:
         If return_final_states=False:
@@ -400,5 +458,5 @@ def mamba3_siso_combined(
 
     return _Mamba3Function.apply(
         Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles, D, Z,
-        Input_Angle_State, Input_SSM_State, Input_K_State, Input_V_State, cu_seqlens, chunk_size, return_final_states
+        Input_Angle_State, Input_SSM_State, Input_K_State, Input_V_State, cu_seqlens, chunk_size, memory_efficient, return_final_states
     )

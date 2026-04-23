@@ -43,6 +43,7 @@ class Mamba3(nn.Module):
         mimo_rank=4,
         #-------------------------------------------
         # Fused kernel and sharding options
+        use_mem_eff_path=True,
         chunk_size=64, # Recommended: 64 for SISO, 64/mimo_rank for MIMO
         dropout=0.0,  # Just to absorb the kwarg
         layer_idx=None,  # Absorb kwarg for general module
@@ -63,6 +64,7 @@ class Mamba3(nn.Module):
         self.is_outproj_norm=is_outproj_norm
         self.is_mimo = is_mimo
         self.mimo_rank = mimo_rank
+        self.use_mem_eff_path = use_mem_eff_path
         if not self.is_mimo:
             self.mimo_rank = 1
         else:
@@ -200,6 +202,7 @@ class Mamba3(nn.Module):
                 chunk_size=self.chunk_size,
                 rotary_dim_divisor=self.rotary_dim_divisor,
                 dtype=x.dtype,
+                memory_efficient=self.use_mem_eff_path,
                 return_state=ssm_state is not None,
                 cu_seqlens=cu_seqlens,
             )
