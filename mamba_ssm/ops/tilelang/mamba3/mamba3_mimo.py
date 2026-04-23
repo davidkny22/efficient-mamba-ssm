@@ -58,7 +58,7 @@ class _Mamba3Function(torch.autograd.Function):
         ctx.rotary_dim_divisor = rotary_dim_divisor
         ctx.dtype = dtype
         (Q, K, V, ADT, DT, Trap, Q_bias, K_bias, MIMO_V, MIMO_Z, MIMO_Out, Angles, D, Z) = tuple(
-            t.contiguous() if t is not None else None
+            t if (t is None or t.is_contiguous()) else t.contiguous()
             for t in (
                 Q, K, V, ADT, DT, Trap, Q_bias, K_bias, MIMO_V, MIMO_Z, MIMO_Out, Angles, D, Z,
             )
