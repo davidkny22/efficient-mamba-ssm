@@ -13,17 +13,20 @@ from einops import rearrange, repeat
 
 import triton
 import triton.language as tl
-from mamba_ssm.ops.triton.mamba3.quantize_helpers import quantize_block_e5m2
 from mamba_ssm.ops.triton.mamba3.utils import cos_approx, sin_approx, sigmoid_approx
 
 
 @triton.jit
 def _dot_e5m2(a, b, KERNEL_PRECISION: tl.constexpr):
-    if KERNEL_PRECISION == "bf16":
-        return tl.dot(a, b)
-    a8, sa = quantize_block_e5m2(a)
-    b8, sb = quantize_block_e5m2(b)
-    return tl.dot_scaled(a8, sa, "e5m2", tl.trans(b8), sb, "e5m2")
+    # FP8 E5M2 backward requires Triton 3.6+ (tl.dot_scaled). For now, always use tl.dot.
+    # When Triton 3.6 is available, uncomment the quantized path below.
+    return tl.dot(a, b)
+    # if KERNEL_PRECISION != "bf16":
+    #     from mamba_ssm.ops.triton.mamba3.quantize_helpers import quantize_block_e5m2
+    #     a8, sa = quantize_block_e5m2(a)
+    #     b8, sb = quantize_block_e5m2(b)
+    #     return tl.dot_scaled(a8, sa, "e5m2", tl.trans(b8), sb, "e5m2")
+    # return tl.dot(a, b)
 
 # =============================================================================
 # dZ Kernel

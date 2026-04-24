@@ -24,11 +24,8 @@ from mamba_ssm.utils.determinism import (
 
 @triton.jit
 def _dot_e5m2(a, b, KERNEL_PRECISION: tl.constexpr):
-    if KERNEL_PRECISION == "bf16":
-        return tl.dot(a, b)
-    a8, sa = quantize_block_e5m2(a)
-    b8, sb = quantize_block_e5m2(b)
-    return tl.dot_scaled(a8, sa, "e5m2", tl.trans(b8), sb, "e5m2")
+    # FP8 backward requires Triton 3.6+ (tl.dot_scaled). Always use tl.dot for now.
+    return tl.dot(a, b)
 
 
 def init_to_zero(names):

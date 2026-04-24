@@ -11,8 +11,6 @@ def quantize_block_e4m3(x, BLOCK_SCALE_SIZE: tl.constexpr = 16):
     NUMEL = M * N
     NUM_BLOCKS = NUMEL // BLOCK_SCALE_SIZE
 
-    tl.static_assert(NUMEL % BLOCK_SCALE_SIZE == 0)
-
     x_blocks = tl.reshape(x.to(tl.float32), [NUM_BLOCKS, BLOCK_SCALE_SIZE])
     absmax = tl.max(tl.abs(x_blocks), axis=1)
     scales = tl.maximum(absmax / 448.0, 1.0e-12)
@@ -30,9 +28,6 @@ def quantize_block_e2m1(x, BLOCK_SCALE_SIZE: tl.constexpr = 16):
     N = x.shape[1]
     NUMEL = M * N
     NUM_BLOCKS = NUMEL // BLOCK_SCALE_SIZE
-
-    tl.static_assert(NUMEL % BLOCK_SCALE_SIZE == 0)
-    tl.static_assert(N % 2 == 0)
 
     x_blocks = tl.reshape(x.to(tl.float32), [NUM_BLOCKS, BLOCK_SCALE_SIZE])
     absmax = tl.max(tl.abs(x_blocks), axis=1)
@@ -80,8 +75,6 @@ def quantize_block_e5m2(x, BLOCK_SCALE_SIZE: tl.constexpr = 16):
     N = x.shape[1]
     NUMEL = M * N
     NUM_BLOCKS = NUMEL // BLOCK_SCALE_SIZE
-
-    tl.static_assert(NUMEL % BLOCK_SCALE_SIZE == 0)
 
     x_blocks = tl.reshape(x.to(tl.float32), [NUM_BLOCKS, BLOCK_SCALE_SIZE])
     absmax = tl.max(tl.abs(x_blocks), axis=1)
